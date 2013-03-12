@@ -1,18 +1,21 @@
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
-#include <netinet/in.h> //sockaddr_in
 #include <sys/stat.h> //stat
 #include <sys/mman.h>
+#include <netinet/in.h> //sockaddr_in
 #include "rio.h"
 
 #define LISTENQ 1024
 #define MAXLINE 4096
 
 extern char **environ;
+sigjmp_buf jmpbuf;
 
 int open_listenfd(int port);
 void doit(int fd);
@@ -22,6 +25,7 @@ void serve_static(int fd, char *filename, int filesize);
 void get_filetype(char *filename, char *filetype);
 void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
+void sighandler(int signo);
 
 int main(int argc, char **argv)
 {
@@ -35,11 +39,15 @@ int main(int argc, char **argv)
 
 	port = atoi(argv[1]);
 
+	signal(SIGPIPE,sighandler);
+
 	listenfd = open_listenfd(port);
 	while(1) {
 		clientlen = sizeof(clientaddr);
 		connfd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen);
 		doit(connfd);
+
+		sigsetjmp(jmpbuf,1);
 		close(connfd);
 	}
 }
@@ -220,4 +228,13 @@ void serve_dynamic(int fd, char *filename, char *cgiargs)
 		execve(filename, emptylist, environ);
 	}
 	wait(NULL);
+}
+
+void sighandler(int signo)
+{
+	if(signo == SIGPIPE)
+	{
+		puts("SIGPIPG");
+		siglongjmp(jmpbuf,1);
+	}
 }
