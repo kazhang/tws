@@ -15,7 +15,6 @@
 #define MAXLINE 4096
 
 extern char **environ;
-sigjmp_buf jmpbuf;
 
 int open_listenfd(int port);
 void doit(int fd);
@@ -39,7 +38,7 @@ int main(int argc, char **argv)
 
 	port = atoi(argv[1]);
 
-	signal(SIGPIPE,sighandler);
+	signal(SIGPIPE, SIG_IGN);
 
 	listenfd = open_listenfd(port);
 	while(1) {
@@ -47,7 +46,6 @@ int main(int argc, char **argv)
 		connfd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen);
 		doit(connfd);
 
-		sigsetjmp(jmpbuf,1);
 		close(connfd);
 	}
 }
@@ -229,13 +227,4 @@ void serve_dynamic(int fd, char *filename, char *cgiargs)
 		execve(filename, emptylist, environ);
 	}
 	wait(NULL);
-}
-
-void sighandler(int signo)
-{
-	if(signo == SIGPIPE)
-	{
-		puts("SIGPIPG");
-		siglongjmp(jmpbuf,1);
-	}
 }
