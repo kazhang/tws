@@ -142,11 +142,12 @@ void read_requesthdrs(rio_t *rp)
 {
 	char buf[MAXLINE];
 
-	rio_readlineb(rp, buf, MAXLINE);
-	while(strcmp(buf,"\r\n")) {
+	ssize_t nread = rio_readlineb(rp, buf, MAXLINE);
+	while(nread != 0 && strcmp(buf,"\r\n")) {
 		printf("%s", buf);
-		rio_readlineb(rp, buf, MAXLINE);
+		nread = rio_readlineb(rp, buf, MAXLINE);
 	}
+	putchar(10);
 	return;
 }
 
