@@ -333,7 +333,7 @@ int main(int argc, char **argv)
 
 	int i;
 	tws_start_thread(master_thread, ctx);
-	for(i = 0;i < 10;i++) {
+	for(i = 0;i < 20;i++) {
 		tws_start_thread(worker_thread, ctx);
 	}
 
