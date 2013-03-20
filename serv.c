@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/stat.h> //stat
 #include <sys/mman.h>
 #include <netinet/in.h> //sockaddr_in
@@ -13,8 +14,37 @@
 
 #define LISTENQ 1024
 #define MAXLINE 4096
+#define NUM_THREAD 16
+#define ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
 
 extern char **environ;
+
+union usa {
+	struct sockaddr sa;
+	struct sockaddr_in sin;
+};
+
+struct socket {
+	int sock;
+	union usa lsa;
+	union usa rsa;
+};
+
+struct tws_context {
+	int port;
+
+	volatile int num_threads;
+	pthread_mutex_t mutex;
+	pthread_cond_t 	cond;
+
+	struct socket queue[20];
+	volatile int sq_head;
+	volatile int sq_tail;
+	pthread_cond_t sq_full;
+	pthread_cond_t sq_empty;
+
+	int stop_flag;
+};
 
 int open_listenfd(int port);
 void doit(int fd);
@@ -26,28 +56,14 @@ void serve_dynamic(int fd, char *filename, char *cgiargs);
 void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
 void sighandler(int signo);
 
-int main(int argc, char **argv)
-{
-	int listenfd, connfd, port, clientlen;
-	struct sockaddr_in clientaddr;
+typedef void *(tws_thread_func_t)(void *);
+static int tws_start_thread(tws_thread_func_t func, void *param) {
+	pthread_t thread_id;
+	pthread_attr_t attr;
 
-	if(argc != 2) {
-		fprintf(stderr,"usage: %s <port>\n", argv[0]);
-		exit(1);
-	}
-
-	port = atoi(argv[1]);
-
-	signal(SIGPIPE, SIG_IGN);
-
-	listenfd = open_listenfd(port);
-	while(1) {
-		clientlen = sizeof(clientaddr);
-		connfd = accept(listenfd, (struct sockaddr*)&clientaddr, &clientlen);
-		doit(connfd);
-
-		close(connfd);
-	}
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	return pthread_create(&thread_id, &attr, func, param);
 }
 
 int open_listenfd(int port){
@@ -227,4 +243,103 @@ void serve_dynamic(int fd, char *filename, char *cgiargs)
 		execve(filename, emptylist, environ);
 	}
 	wait(NULL);
+}
+
+static void *consume_socket(struct tws_context *ctx, struct socket *sp) {
+	pthread_mutex_lock(&ctx->mutex);
+	int sz = ARRAY_SIZE(ctx->queue);
+
+	while(ctx->stop_flag == 0 && ctx->sq_head == ctx->sq_tail) {
+		pthread_cond_wait(&ctx->sq_full, &ctx->mutex);
+	}
+
+	if(ctx->sq_tail > ctx->sq_head) {
+		*sp = ctx->queue[ctx->sq_head % sz];
+		ctx->sq_head++;
+		if(ctx->sq_head >= sz) {
+			ctx->sq_head -=sz;
+			ctx->sq_tail -=sz;
+		}
+	}
+	pthread_cond_signal(&ctx->sq_empty);
+	pthread_mutex_unlock(&ctx->mutex);
+}	
+
+static void *worker_thread(void *arg) {
+	struct tws_context *ctx = (struct tws_context*) arg;
+	struct socket client;
+
+	while(1) {
+		consume_socket(ctx, &client);
+		printf("Thread %u handling\n",(unsigned int)pthread_self());
+		doit(client.sock);
+		close(client.sock);
+	}
+	return NULL;
+}
+
+static void produce_socket(struct tws_context *ctx, struct socket *sp) {
+	pthread_mutex_lock(&ctx->mutex);
+	int sz = ARRAY_SIZE(ctx->queue);
+	
+	while(ctx->stop_flag == 0 && ctx->sq_tail - ctx->sq_head >= sz) {
+		pthread_cond_wait(&ctx->sq_empty, &ctx->mutex);
+	}
+
+	if(ctx->sq_tail - ctx->sq_head < sz) {
+		ctx->queue[ctx->sq_tail % sz] = *sp;
+		ctx->sq_tail++;
+	}
+	pthread_cond_signal(&ctx->sq_full);
+	pthread_mutex_unlock(&ctx->mutex);
+}
+
+static void *master_thread(void *arg) {
+	struct tws_context *ctx = (struct tws_context *)arg;
+	struct socket listenfd, so;
+   	socklen_t len;
+	struct sockaddr_in clientaddr;
+
+	listenfd.sock = open_listenfd(ctx->port);
+	while(1) {
+		len = sizeof(clientaddr);
+		if((so.sock = accept(listenfd.sock, (struct sockaddr*)&so.rsa.sa, &len)) < 0) {
+		}
+		else {
+			getsockname(so.sock, &so.lsa.sa, &len);	
+			produce_socket(ctx, &so);
+		}
+	}
+	return NULL;
+}
+
+int main(int argc, char **argv)
+{
+	if(argc != 2) {
+		fprintf(stderr,"usage: %s <port>\n", argv[0]);
+		exit(1);
+	}
+
+	struct tws_context *ctx = malloc(sizeof(struct tws_context));
+
+	ctx->port = atoi(argv[1]);
+	ctx->sq_head = 0;
+	ctx->sq_tail = 0;
+	pthread_mutex_init(&ctx->mutex, NULL);
+	pthread_cond_init(&ctx->sq_full, NULL);
+	pthread_cond_init(&ctx->sq_empty, NULL);
+
+	signal(SIGPIPE, SIG_IGN);
+
+	int i;
+	tws_start_thread(master_thread, ctx);
+	for(i = 0;i < 10;i++) {
+		tws_start_thread(worker_thread, ctx);
+	}
+
+	while( ctx->stop_flag != 1) {
+		sleep(1);
+	}
+	free(ctx);
+	return 0;
 }
