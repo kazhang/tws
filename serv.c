@@ -101,6 +101,7 @@ void doit(int fd)
 	rio_readinitb(&rio, fd);
 	rio_readlineb(&rio, buf, MAXLINE);
 	sscanf(buf,"%s %s %s",method, uri, version);
+	printf("%s",buf);
 	if(strcasecmp(method, "GET")) {
 		clienterror(fd, method, "501", "Not Implemented",
 					"Taiweisuo dose not implement this method");
