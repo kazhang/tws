@@ -1,3 +1,4 @@
+#include <poll.h>
 #include <stdio.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,7 +15,7 @@
 
 #define LISTENQ 1024
 #define MAXLINE 4096
-#define NUM_THREAD 16
+#define NUM_THREAD 20 
 #define ARRAY_SIZE(array) (sizeof(array) / sizeof(array[0]))
 
 extern char **environ;
@@ -101,7 +102,9 @@ void doit(int fd)
 	rio_readinitb(&rio, fd);
 	rio_readlineb(&rio, buf, MAXLINE);
 	sscanf(buf,"%s %s %s",method, uri, version);
+#ifdef DEBUG
 	printf("%s",buf);
+#endif
 	if(strcasecmp(method, "GET")) {
 		clienterror(fd, method, "501", "Not Implemented",
 					"Taiweisuo dose not implement this method");
@@ -159,10 +162,11 @@ void read_requesthdrs(rio_t *rp)
 
 	ssize_t nread = rio_readlineb(rp, buf, MAXLINE);
 	while(nread != 0 && strcmp(buf,"\r\n")) {
+#ifdef DEBUG
 		printf("%s", buf);
+#endif
 		nread = rio_readlineb(rp, buf, MAXLINE);
 	}
-	putchar(10);
 	return;
 }
 
@@ -246,7 +250,7 @@ void serve_dynamic(int fd, char *filename, char *cgiargs)
 	wait(NULL);
 }
 
-static void *consume_socket(struct tws_context *ctx, struct socket *sp) {
+static int consume_socket(struct tws_context *ctx, struct socket *sp) {
 	pthread_mutex_lock(&ctx->mutex);
 	int sz = ARRAY_SIZE(ctx->queue);
 
@@ -264,18 +268,30 @@ static void *consume_socket(struct tws_context *ctx, struct socket *sp) {
 	}
 	pthread_cond_signal(&ctx->sq_empty);
 	pthread_mutex_unlock(&ctx->mutex);
+	
+	return ctx->stop_flag == 0;
 }	
 
 static void *worker_thread(void *arg) {
 	struct tws_context *ctx = (struct tws_context*) arg;
 	struct socket client;
 
-	while(1) {
-		consume_socket(ctx, &client);
+	while(consume_socket(ctx, &client)) {
+#ifdef DEBUG
 		printf("Thread %u handling\n",(unsigned int)pthread_self());
+#endif
 		doit(client.sock);
 		close(client.sock);
 	}
+
+	pthread_mutex_lock(&ctx->mutex);
+	ctx->num_threads --;
+	pthread_cond_signal(&ctx->cond);
+	pthread_mutex_unlock(&ctx->mutex);
+
+#ifdef DEBUG
+	printf("Worker thread %u exit.\n",(unsigned int)pthread_self());
+#endif
 	return NULL;
 }
 
@@ -297,21 +313,55 @@ static void produce_socket(struct tws_context *ctx, struct socket *sp) {
 
 static void *master_thread(void *arg) {
 	struct tws_context *ctx = (struct tws_context *)arg;
+
+	struct sched_param sched_param;
+	sched_param.sched_priority = sched_get_priority_max(SCHED_RR);
+	pthread_setschedparam(pthread_self(), SCHED_RR, &sched_param);
+
 	struct socket listenfd, so;
    	socklen_t len;
 	struct sockaddr_in clientaddr;
 
 	listenfd.sock = open_listenfd(ctx->port);
-	while(1) {
-		len = sizeof(clientaddr);
-		if((so.sock = accept(listenfd.sock, (struct sockaddr*)&so.rsa.sa, &len)) < 0) {
-		}
-		else {
-			getsockname(so.sock, &so.lsa.sa, &len);	
-			produce_socket(ctx, &so);
+
+	struct pollfd pfd;
+	pfd.fd = listenfd.sock;
+	pfd.events = POLLIN;
+
+	while(ctx->stop_flag == 0) {
+		if(poll(&pfd, 1, 200) > 0) {
+			len = sizeof(clientaddr);
+			if((so.sock = accept(listenfd.sock, (struct sockaddr*)&so.rsa.sa, &len)) < 0) {
+			}
+			else {
+				getsockname(so.sock, &so.lsa.sa, &len);	
+				produce_socket(ctx, &so);
+			}
 		}
 	}
+	close(listenfd.sock);
+	pthread_cond_broadcast(&ctx->sq_full);
+	pthread_mutex_lock(&ctx->mutex);
+	while(ctx->num_threads > 0) {
+		pthread_cond_wait(&ctx->cond, &ctx->mutex);
+	}
+	pthread_mutex_unlock(&ctx->mutex);
+
+	pthread_mutex_destroy(&ctx->mutex);
+	pthread_cond_destroy(&ctx->sq_full);
+	pthread_cond_destroy(&ctx->sq_empty);
+	pthread_cond_destroy(&ctx->cond);
+
+#ifdef DEBUG
+	printf("Master thread %u exit.\n",(unsigned int)pthread_self());
+#endif
+	ctx->stop_flag = 2;
 	return NULL;
+}
+
+int exit_flag;
+static void signal_handler(int signum) {
+	exit_flag = signum;
 }
 
 int main(int argc, char **argv)
@@ -323,24 +373,36 @@ int main(int argc, char **argv)
 
 	struct tws_context *ctx = malloc(sizeof(struct tws_context));
 
+	exit_flag = 0;
 	ctx->port = atoi(argv[1]);
 	ctx->sq_head = 0;
 	ctx->sq_tail = 0;
+	ctx->num_threads = NUM_THREAD;
 	pthread_mutex_init(&ctx->mutex, NULL);
+	pthread_cond_init(&ctx->cond, NULL);
 	pthread_cond_init(&ctx->sq_full, NULL);
 	pthread_cond_init(&ctx->sq_empty, NULL);
 
 	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
 
 	int i;
 	tws_start_thread(master_thread, ctx);
-	for(i = 0;i < 20;i++) {
+	for(i = 0;i < NUM_THREAD;i++) {
 		tws_start_thread(worker_thread, ctx);
 	}
 
-	while( ctx->stop_flag != 1) {
+	while(exit_flag == 0) {
 		sleep(1);
 	}
+	printf("Exiting on signal %d, waiting for all threads to finish...\n", exit_flag);
+	ctx->stop_flag = 1;
+	
+	while(ctx->stop_flag != 2) {
+		usleep(10*1000);
+	}
 	free(ctx);
+	printf("Done.\n");
 	return 0;
 }
